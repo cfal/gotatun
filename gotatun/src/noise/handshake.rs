@@ -299,13 +299,6 @@ enum HandshakeState {
     None,
     /// We initiated the handshake
     InitSent(HandshakeInitSentState),
-    /// Handshake initiated by peer
-    InitReceived {
-        hash: [u8; KEY_LEN],
-        chaining_key: [u8; KEY_LEN],
-        peer_ephemeral_public: x25519::PublicKey,
-        peer_index: u32,
-    },
     /// Handshake was established too long ago (implies no handshake is in progress)
     Expired,
 }
@@ -499,6 +492,36 @@ impl Handshake {
         self.state = HandshakeState::Expired;
     }
 
+    /// Stops retransmitting our in-flight initiation, if any.
+    ///
+    /// A pending initiation moves to `previous` so a delayed response still completes it; if no
+    /// initiation is in flight, any older retained `previous` initiation is invalidated because a
+    /// newer key exchange has superseded it.
+    pub(crate) fn stop_retransmit(&mut self) {
+        self.previous = if matches!(self.state, HandshakeState::InitSent(_)) {
+            std::mem::replace(&mut self.state, HandshakeState::None)
+        } else {
+            HandshakeState::None
+        };
+    }
+
+    /// Abandons a timed-out handshake attempt without expiring active sessions.
+    pub(crate) fn abandon_initiation(&mut self) {
+        if matches!(self.state, HandshakeState::InitSent(_)) {
+            self.state = HandshakeState::None;
+        }
+        self.previous = HandshakeState::None;
+    }
+
+    /// Clears a retained previous initiation once it has outlived `REKEY_ATTEMPT_TIME`.
+    pub(crate) fn expire_previous(&mut self) {
+        if let HandshakeState::InitSent(ref state) = self.previous
+            && state.time_sent.elapsed() >= super::timers::REKEY_ATTEMPT_TIME
+        {
+            self.previous = HandshakeState::None;
+        }
+    }
+
     /// Reset the handshake to its initial state, so a fresh handshake can be initiated.
     pub(crate) fn reset(&mut self) {
         self.previous = HandshakeState::None;
@@ -612,23 +635,27 @@ impl Handshake {
         // initiator.hash = HASH(initiator.hash || msg.encrypted_timestamp)
         hash = b2s_hash(&hash, packet.timestamp.as_bytes());
 
-        self.previous = std::mem::replace(
-            &mut self.state,
-            HandshakeState::InitReceived {
-                chaining_key,
-                hash,
-                peer_ephemeral_public,
-                peer_index: peer_index.get(),
-            },
-        );
+        // A valid initiation ends the expired state. Our own in-flight initiation is kept, so
+        // during simultaneous initiation it keeps retransmitting and still accepts its response.
+        if self.is_expired() {
+            self.state = HandshakeState::None;
+        }
 
-        Ok(self.format_handshake_response(packet.into_bytes()))
+        Ok(self.format_handshake_response(
+            packet.into_bytes(),
+            chaining_key,
+            hash,
+            peer_ephemeral_public,
+            peer_index.get(),
+        ))
     }
 
     pub(super) fn receive_handshake_response(
         &mut self,
         packet: &WgHandshakeResp,
     ) -> Result<Session, WireGuardError> {
+        self.expire_previous();
+
         // Check if there is a handshake awaiting a response and take the correct one
         let expected =
             |s: &HandshakeInitSentState| s.local_index.value() == packet.receiver_idx.get();
@@ -699,6 +726,7 @@ impl Handshake {
         // Remove handshake state at the very end so it's kept in case of an error
         let is_current = matches!(&self.state, HandshakeState::InitSent(state) if expected(state));
         let state = if is_current {
+            self.previous = HandshakeState::None;
             let HandshakeState::InitSent(state) =
                 std::mem::replace(&mut self.state, HandshakeState::None)
             else {
@@ -856,20 +884,11 @@ impl Handshake {
     fn format_handshake_response(
         &mut self,
         buf: crate::packet::Packet,
+        mut chaining_key: [u8; KEY_LEN],
+        mut hash: [u8; KEY_LEN],
+        peer_ephemeral_public: x25519::PublicKey,
+        peer_index: u32,
     ) -> (crate::packet::Packet<WgHandshakeResp>, Session) {
-        let state = std::mem::replace(&mut self.state, HandshakeState::None);
-        let (mut chaining_key, mut hash, peer_ephemeral_public, peer_index) = match state {
-            HandshakeState::InitReceived {
-                chaining_key,
-                hash,
-                peer_ephemeral_public,
-                peer_index,
-            } => (chaining_key, hash, peer_ephemeral_public, peer_index),
-            _ => {
-                panic!("Unexpected attempt to call send_handshake_response");
-            }
-        };
-
         // responder.ephemeral_private = DH_GENERATE()
         let ephemeral_private = x25519::ReusableSecret::random_from_rng(rand_core::OsRng);
         let local_index = self.index_table.new_index();

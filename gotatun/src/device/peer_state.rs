@@ -37,7 +37,7 @@ pub struct Endpoint {
 
 /// A handshake initiated by [`PeerState::force_handshake`].
 pub struct PendingHandshake {
-    /// Notified when a handshake initiated by us completes.
+    /// Notified when an authenticated handshake completes in either direction.
     pub completed: watch::Receiver<()>,
     /// The initiation to send and where to send it, or `None` if one is already in flight.
     pub initiation: Option<(Packet<WgHandshakeInit>, SocketAddr)>,
@@ -54,7 +54,7 @@ pub struct PeerState {
     #[cfg(feature = "daita")]
     pub(crate) daita: Option<DaitaHooks>,
 
-    /// Notified whenever a handshake that we initiated completes.
+    /// Notified whenever an authenticated handshake completes in either direction.
     handshake_completed: watch::Sender<()>,
 }
 
@@ -79,27 +79,28 @@ impl PeerState {
 
     /// Process an incoming packet received from `addr`.
     ///
-    /// Any authenticated packet updates the peer endpoint to `addr`. Waiters are notified if the
-    /// packet completes a handshake that we initiated.
+    /// Any authenticated packet updates the peer endpoint to `addr`. Waiters are notified when the
+    /// packet completes a handshake in either direction.
     pub fn handle_incoming_packet(&mut self, packet: WgKind, addr: SocketAddr) -> TunnResult {
         let is_handshake_resp = matches!(packet, WgKind::HandshakeResp(_));
+        let previous_generation = self.tunnel.current_session_generation();
         let result = self.tunnel.handle_incoming_packet(packet);
-        match result {
-            TunnResult::WriteToNetwork(_) => {
-                self.endpoint.addr = Some(addr);
-                if is_handshake_resp {
-                    self.notify_handshake_completed();
-                }
-            }
-            TunnResult::WriteToTunnel(_) => self.endpoint.addr = Some(addr),
+        let session_promoted = self.tunnel.current_session_generation() != previous_generation;
+        let completed = match result {
+            TunnResult::WriteToNetwork(_) => is_handshake_resp || session_promoted,
+            TunnResult::WriteToTunnel(_) => session_promoted,
             // Don't update the peer endpoint on cookie replies, for consistency
             // with both the Linux kernel and wireguard-go.
-            TunnResult::Done | TunnResult::Err(_) => {}
+            TunnResult::Done | TunnResult::Err(_) => return result,
+        };
+        self.endpoint.addr = Some(addr);
+        if completed {
+            self.notify_handshake_completed();
         }
         result
     }
 
-    /// Subscribe to completions of handshakes that we initiated.
+    /// Subscribe to authenticated handshake completions in either direction.
     ///
     /// The receiver only sees completions that happen after this call.
     fn subscribe_handshake_completed(&self) -> watch::Receiver<()> {

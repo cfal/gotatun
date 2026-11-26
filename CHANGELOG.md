@@ -14,6 +14,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   This is the first step in addressing note _[3.5 Sensitive data not protected in memory]_ from the
   2026 audit of GotaTun by Assured.
 
+### Fixed
+- Release the device and peer locks before writing received packets to the TUN device or the
+  UDP socket. A backpressured TUN device no longer stalls timers, outgoing traffic, and the
+  configuration API.
+- Keep sending persistent keepalives after a handshake expires. A peer with persistent keepalive
+  now initiates a new handshake one keepalive interval after expiry instead of going silent until
+  outgoing traffic arrives, matching the Linux kernel and wireguard-go.
+- Only let a responder session take over the session timers once the initiator confirms it. A
+  lost handshake response no longer stops the initiator of the current session from rekeying.
+- Keep our pending handshake initiation, and its retransmissions, when answering a simultaneous
+  initiation from the peer.
+- Order sessions by creation, so late packets on an older session no longer switch sending back
+  to that session.
+- Do not stop the device when sending a cookie reply fails.
+
 [3.5 Sensitive data not protected in memory]: audits/2026-02-17-Assured.md#35-sensitive-data-not-protected-in-memory-note
 
 ## [0.10.3] - 2026-11-09

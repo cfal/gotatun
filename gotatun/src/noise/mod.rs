@@ -70,17 +70,32 @@ impl From<WireGuardError> for TunnResult {
     }
 }
 
+/// A session together with the metadata used to order and age it.
+struct SessionSlot {
+    session: session::Session,
+    /// Creation order of the session, strictly increasing within a [`Tunn`].
+    generation: u64,
+    /// Whether we sent the initiation of the handshake that derived this session.
+    is_initiator: bool,
+    /// Time the session keys were derived.
+    derived_at: Duration,
+}
+
 /// Tunnel represents a point-to-point WireGuard connection.
 pub struct Tunn<R: RngCore + Send = StdRng> {
     /// The handshake currently in progress.
     handshake: handshake::Handshake,
-    /// The [`N_SESSIONS`] most recent sessions.
-    sessions: [Option<session::Session>; N_SESSIONS],
-    /// Index of the most recently used session.
+    /// The [`N_SESSIONS`] most recent confirmed sessions.
+    sessions: [Option<SessionSlot>; N_SESSIONS],
+    /// Most recent unconfirmed responder session, kept outside `sessions` so unanswered peer
+    /// initiations cannot evict confirmed sessions.
+    pending_responder: Option<SessionSlot>,
+    /// Index in `sessions` of the session used for sending.
     current: usize,
-    /// Counter for slot selection when inserting new sessions.
-    /// Used to find the next index in `sessions` with `session_counter % N_SESSIONS`.
-    session_counter: usize,
+    /// Strictly increasing generation assigned to each derived session.
+    session_counter: u64,
+    /// Round-robin insertion cursor for confirmed slots in `sessions`.
+    confirmed_counter: usize,
     /// Queue to store blocked packets.
     packet_queue: VecDeque<Packet>,
 
@@ -137,8 +152,10 @@ impl<R: RngCore + Send> Tunn<R> {
                 preshared_key,
             ),
             sessions: Default::default(),
+            pending_responder: None,
             current: Default::default(),
             session_counter: Default::default(),
+            confirmed_counter: Default::default(),
             tx_bytes: Default::default(),
             rx_bytes: Default::default(),
 
@@ -165,6 +182,17 @@ impl<R: RngCore + Send> Tunn<R> {
         self.handshake.reset();
     }
 
+    fn clear_sessions(&mut self) {
+        for session in &mut self.sessions {
+            *session = None;
+        }
+        self.pending_responder = None;
+    }
+
+    fn current_session(&self) -> Option<&SessionSlot> {
+        self.sessions[self.current % N_SESSIONS].as_ref()
+    }
+
     /// Update the private key and clear existing sessions.
     pub fn set_static_private(
         &mut self,
@@ -175,9 +203,7 @@ impl<R: RngCore + Send> Tunn<R> {
         self.rate_limiter = rate_limiter;
         self.handshake
             .set_static_private(static_private, static_public);
-        for s in &mut self.sessions {
-            *s = None;
-        }
+        self.clear_sessions();
     }
 
     /// Update the preshared key used for future handshakes.
@@ -229,10 +255,9 @@ impl<R: RngCore + Send> Tunn<R> {
     /// Returns `Err(original_packet)` if there is no active session, or if the active session's
     /// sending counter has reached `REJECT_AFTER_MESSAGES`.
     pub fn encapsulate_with_session(&mut self, packet: Packet) -> Result<Packet<WgData>, Packet> {
-        let current = self.current;
-        if let Some(ref session) = self.sessions[current % N_SESSIONS] {
+        if let Some(slot) = self.current_session() {
             // Send the packet using an established session
-            let packet = session.format_packet_data(packet)?;
+            let packet = slot.session.format_packet_data(packet)?;
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !packet.is_keepalive() {
@@ -268,13 +293,17 @@ impl<R: RngCore + Send> Tunn<R> {
         let (packet, session) = self.handshake.receive_handshake_initialization(p)?;
         self.rx_bytes += n_bytes;
 
-        // Store new session in next slot
-        let slot = self.next_session_slot();
-        self.put_session(slot, session);
+        let generation = self.next_session_generation();
+        self.pending_responder = Some(SessionSlot {
+            session,
+            generation,
+            is_initiator: false,
+            derived_at: self.timers[TimerName::TimeCurrent],
+        });
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick(TimerName::TimeLastPacketSent);
-        self.timer_tick_session_established(false, slot); // New session established, we are not the initiator
+        self.timer_tick(TimerName::TimeSessionDerived);
 
         self.tx_bytes += packet.as_bytes().len();
 
@@ -300,13 +329,16 @@ impl<R: RngCore + Send> Tunn<R> {
         let keepalive_packet = session
             .format_packet_data(p)
             .expect("a freshly established session's counter cannot be exhausted");
-        // Store new session in next slot
-        let slot = self.next_session_slot();
-        self.put_session(slot, session);
+        let generation = self.next_session_generation();
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
-        self.timer_tick_session_established(true, slot); // New session established, we are the initiator
-        self.set_current_session(slot);
+        self.timer_tick(TimerName::TimeSessionDerived);
+        self.install_confirmed_session(SessionSlot {
+            session,
+            generation,
+            is_initiator: true,
+            derived_at: self.timers[TimerName::TimeCurrent],
+        });
 
         tracing::debug!("Sending keepalive");
         self.tx_bytes += keepalive_packet.as_bytes().len();
@@ -323,35 +355,59 @@ impl<R: RngCore + Send> Tunn<R> {
         Ok(TunnResult::Done)
     }
 
-    /// Update the slot index of the currently used session, if needed.
-    fn set_current_session(&mut self, new_slot: usize) {
-        let cur_slot = self.current;
-        if cur_slot == new_slot {
-            // There is nothing to do, already using this session, this is the common case
-            return;
-        }
-        if self.sessions[cur_slot % N_SESSIONS].is_none()
-            || self.timers.session_timers[new_slot % N_SESSIONS]
-                >= self.timers.session_timers[cur_slot % N_SESSIONS]
-        {
-            self.current = new_slot;
-            tracing::trace!("New session slot: {new_slot}");
-        }
+    /// Returns the generation of the current confirmed send session, if any.
+    pub(crate) fn current_session_generation(&self) -> Option<u64> {
+        self.current_session().map(|slot| slot.generation)
     }
 
-    /// Get the next round-robin session slot index.
-    fn next_session_slot(&mut self) -> usize {
-        let slot = self.session_counter % N_SESSIONS;
-        self.session_counter = self.session_counter.wrapping_add(1);
+    /// Returns whether any outbound packets are waiting in `packet_queue`.
+    pub(crate) fn has_queued_packets(&self) -> bool {
+        !self.packet_queue.is_empty()
+    }
+
+    /// Returns whether any unexpired session (confirmed or awaiting confirmation) exists.
+    pub(super) fn has_unexpired_session(&self) -> bool {
+        self.sessions.iter().any(Option::is_some) || self.pending_responder.is_some()
+    }
+
+    fn next_session_generation(&mut self) -> u64 {
+        let generation = self.session_counter;
+        self.session_counter += 1;
+        generation
+    }
+
+    fn next_confirmed_slot(&mut self, preserve: Option<usize>) -> usize {
+        let mut slot = self.confirmed_counter % N_SESSIONS;
+        self.confirmed_counter = self.confirmed_counter.wrapping_add(1);
+        if preserve == Some(slot) {
+            slot = self.confirmed_counter % N_SESSIONS;
+            self.confirmed_counter = self.confirmed_counter.wrapping_add(1);
+        }
         slot
     }
 
-    /// Place a session into the given slot.
+    /// Installs a confirmed session and promotes it to `current` when strictly newer than the
+    /// active confirmed session.
     ///
-    /// If the slot was occupied, the old session (and its [`Index`](index_table::Index)) is dropped,
-    /// which automatically frees the index from the shared table.
-    fn put_session(&mut self, slot: usize, session: session::Session) {
-        self.sessions[slot % N_SESSIONS] = Some(session);
+    /// Sessions are ordered by generation, so late confirmations or packets on an older session
+    /// never move `current` backwards or overwrite the active send slot.
+    fn install_confirmed_session(&mut self, slot_entry: SessionSlot) {
+        let current_generation = self.current_session_generation();
+        if current_generation.is_some_and(|current| current >= slot_entry.generation) {
+            let slot = self.next_confirmed_slot(Some(self.current % N_SESSIONS));
+            self.sessions[slot] = Some(slot_entry);
+            return;
+        }
+
+        let is_initiator = slot_entry.is_initiator;
+        let slot = self.next_confirmed_slot(None);
+        self.sessions[slot] = Some(slot_entry);
+        self.current = slot;
+        self.timer_tick_session_established(is_initiator);
+        // Like Linux `wg_timers_handshake_complete`, a newly confirmed session stops
+        // retransmission of our pending initiation.
+        self.handshake.stop_retransmit();
+        tracing::trace!("New session slot: {slot}");
     }
 
     /// Decrypt a data packet, and return a [`TunnResult::WriteToTunnel`] (`Ipv4` or `Ipv6`) if
@@ -377,22 +433,28 @@ impl<R: RngCore + Send> Tunn<R> {
     ) -> Result<Packet, WireGuardError> {
         let r_idx = packet.header.receiver_idx.get();
 
-        // Search for the matching session. Almost always self.current, but older
-        // sessions may still receive packets during a key transition.
-        let (slot, session) = self
+        // Search confirmed sessions first (common case), then the pending responder session.
+        let decapsulated_packet = if let Some(slot) = self
             .sessions
             .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.as_ref().map(|s| (i, s)))
-            .find(|(_, s)| s.receiving_index.value() == r_idx)
-            .ok_or_else(|| {
-                tracing::trace!("No session available: {r_idx}");
-                WireGuardError::NoCurrentSession
-            })?;
-
-        let decapsulated_packet = session.receive_packet_data(packet)?;
-
-        self.set_current_session(slot);
+            .flatten()
+            .find(|s| s.session.receiving_index.value() == r_idx)
+        {
+            slot.session.receive_packet_data(packet)?
+        } else if let Some(ref pending) = self.pending_responder
+            && pending.session.receiving_index.value() == r_idx
+        {
+            let decapsulated = pending.session.receive_packet_data(packet)?;
+            let confirmed = self
+                .pending_responder
+                .take()
+                .expect("pending_responder was matched");
+            self.install_confirmed_session(confirmed);
+            decapsulated
+        } else {
+            tracing::trace!("No session available: {r_idx}");
+            return Err(WireGuardError::NoCurrentSession);
+        };
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.rx_bytes += decapsulated_packet.as_bytes().len();
@@ -437,9 +499,10 @@ impl<R: RngCore + Send> Tunn<R> {
         self.timers.rekey_timeout = self.sample_timer(|p| &p.rekey_timeout);
     }
 
-    /// Encapsulate and return all queued packets.
+    /// Encapsulate and return all queued packets once a confirmed send session exists.
     pub fn get_queued_packets(&mut self, tun_mtu: &mut MtuWatcher) -> impl Iterator<Item = WgKind> {
         std::iter::from_fn(|| {
+            self.current_session_generation()?;
             self.dequeue_packet()
                 .and_then(|packet| self.handle_outgoing_packet(packet, Some(tun_mtu)))
         })
@@ -465,8 +528,8 @@ impl<R: RngCore + Send> Tunn<R> {
         let mut total_weight = 0.0;
 
         for i in 0..N_SESSIONS {
-            if let Some(ref session) = self.sessions[session_idx.wrapping_sub(i) % N_SESSIONS] {
-                let (expected, received) = session.current_packet_cnt();
+            if let Some(ref slot) = self.sessions[session_idx.wrapping_sub(i) % N_SESSIONS] {
+                let (expected, received) = slot.session.current_packet_cnt();
 
                 let loss = if expected == 0 {
                     0.0
@@ -540,7 +603,9 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     #[cfg(feature = "mock_instant")]
-    use crate::noise::timers::{MAX_JITTER, REKEY_AFTER_TIME, REKEY_TIMEOUT, TimerName};
+    use crate::noise::timers::{
+        MAX_JITTER, REKEY_AFTER_TIME, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT, TimerName,
+    };
     use crate::packet::Ipv4;
 
     const HANDSHAKE_RATE_LIMIT: u64 = 100;
@@ -860,6 +925,7 @@ mod tests {
         my_tun.sessions[slot]
             .as_ref()
             .expect("session established after handshake")
+            .session
             .set_sending_key_counter(session::REJECT_AFTER_MESSAGES - 1);
 
         // The last in-limit packet is still encapsulated and sent.
@@ -1245,6 +1311,502 @@ mod tests {
             .rate_limiter
             .verify_handshake(legit, init)
             .expect("legitimate IP should not be rate limited");
+    }
+
+    /// Passes a handshake response to `tun` and returns the keepalive it answers with.
+    fn expect_keepalive(tun: &mut Tunn, resp: Packet<WgHandshakeResp>) -> Packet<WgData> {
+        match tun.handle_incoming_packet(WgKind::HandshakeResp(resp)) {
+            TunnResult::WriteToNetwork(WgKind::Data(keepalive)) => keepalive,
+            other => panic!("expected a keepalive after the handshake, got {other:?}"),
+        }
+    }
+
+    /// A persistent keepalive keeps initiating handshakes after the handshake expires, one
+    /// keepalive interval after each expiry rather than on every timer tick.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn persistent_keepalive_restarts_handshake_after_expiry() {
+        const KEEPALIVE: Duration = Duration::from_secs(25);
+        const TICK: Duration = Duration::from_millis(250);
+        const MAX_TICKS: u32 = 1000;
+
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns_with_keepalive(Some(25));
+        let Ok(Some(WgKind::HandshakeInit(mut init))) = my_tun.update_timers() else {
+            panic!("persistent keepalive should initiate a handshake immediately");
+        };
+
+        // The peer is unreachable for two complete handshake attempts.
+        for _ in 0..2 {
+            let started = MockClock::time();
+            let mut retransmits = 0;
+            for tick in 0.. {
+                assert!(tick < MAX_TICKS, "handshake never expired");
+                MockClock::advance(TICK);
+                match my_tun.update_timers() {
+                    Ok(Some(WgKind::HandshakeInit(_))) => retransmits += 1,
+                    Ok(None) => {}
+                    Err(WireGuardError::ConnectionExpired) => break,
+                    other => panic!("unexpected timer result: {other:?}"),
+                }
+            }
+            let expired_at = MockClock::time();
+            assert!(expired_at - started >= REKEY_ATTEMPT_TIME);
+            let max_retransmits = REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs();
+            assert!((1..=max_retransmits).contains(&retransmits));
+
+            for tick in 0.. {
+                assert!(
+                    tick < MAX_TICKS,
+                    "persistent keepalive never restarted the handshake"
+                );
+                MockClock::advance(TICK);
+                match my_tun.update_timers() {
+                    Err(WireGuardError::ConnectionExpired) => {
+                        assert!(MockClock::time() - expired_at < KEEPALIVE);
+                    }
+                    Ok(Some(WgKind::HandshakeInit(restarted))) => {
+                        assert_eq!(MockClock::time() - expired_at, KEEPALIVE);
+                        init = restarted;
+                        break;
+                    }
+                    other => panic!("unexpected timer result: {other:?}"),
+                }
+            }
+            assert!(!my_tun.is_expired());
+        }
+
+        // The peer is reachable again, so the restarted handshake completes.
+        let resp = create_handshake_response(&mut their_tun, init);
+        let keepalive = expect_keepalive(&mut my_tun, resp);
+        parse_keepalive(&mut their_tun, keepalive);
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+        assert_packet_roundtrip(&mut their_tun, &mut my_tun);
+    }
+
+    /// When both peers initiate at once, answering the peer's initiation keeps our own
+    /// initiation pending, and both handshakes complete.
+    #[test]
+    fn simultaneous_initiation_keeps_pending_initiation() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        let my_init = create_handshake_init(&mut my_tun);
+        let their_init = create_handshake_init(&mut their_tun);
+
+        let my_resp = create_handshake_response(&mut my_tun, their_init);
+        let their_resp = create_handshake_response(&mut their_tun, my_init);
+        for tun in [&my_tun, &their_tun] {
+            assert!(
+                tun.handshake.timer().is_some(),
+                "the pending initiation must keep its retransmit timer"
+            );
+            assert!(tun.handshake.is_in_progress());
+        }
+
+        let my_keepalive = expect_keepalive(&mut my_tun, their_resp);
+        let their_keepalive = expect_keepalive(&mut their_tun, my_resp);
+        let (my_current, their_current) = (my_tun.current, their_tun.current);
+
+        // Each side confirms the other's session, which is older than its own initiator session.
+        parse_keepalive(&mut my_tun, their_keepalive);
+        parse_keepalive(&mut their_tun, my_keepalive);
+        assert_eq!(my_tun.current, my_current);
+        assert_eq!(their_tun.current, their_current);
+
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+        assert_packet_roundtrip(&mut their_tun, &mut my_tun);
+    }
+
+    /// Our pending initiation keeps retransmitting after we answer the peer's initiation, as
+    /// long as the peer has not confirmed that session.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn pending_initiation_retransmits_after_answering_peer() {
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        let _lost_init = create_handshake_init(&mut my_tun);
+        let their_init = create_handshake_init(&mut their_tun);
+        let _lost_resp = create_handshake_response(&mut my_tun, their_init);
+
+        MockClock::advance(REKEY_TIMEOUT + MAX_JITTER);
+        let Ok(Some(WgKind::HandshakeInit(retry))) = my_tun.update_timers() else {
+            panic!("the pending initiation should be retransmitted");
+        };
+
+        let resp = create_handshake_response(&mut their_tun, retry);
+        let keepalive = expect_keepalive(&mut my_tun, resp);
+        parse_keepalive(&mut their_tun, keepalive);
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+        assert_packet_roundtrip(&mut their_tun, &mut my_tun);
+    }
+
+    /// Once the peer confirms the session we responded with, our pending initiation stops
+    /// retransmitting, but a late response to it still completes it.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn peer_confirmation_stops_retransmission() {
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        let my_init = create_handshake_init(&mut my_tun);
+        let their_init = create_handshake_init(&mut their_tun);
+        let my_resp = create_handshake_response(&mut my_tun, their_init);
+
+        let their_keepalive = expect_keepalive(&mut their_tun, my_resp);
+        parse_keepalive(&mut my_tun, their_keepalive);
+        assert!(my_tun.handshake.timer().is_none());
+        assert!(my_tun.has_active_session());
+
+        MockClock::advance(REKEY_TIMEOUT + MAX_JITTER);
+        assert!(
+            matches!(my_tun.update_timers(), Ok(None)),
+            "a confirmed session must stop retransmission"
+        );
+
+        let responder_session = my_tun.current;
+        let their_resp = create_handshake_response(&mut their_tun, my_init);
+        let my_keepalive = expect_keepalive(&mut my_tun, their_resp);
+        parse_keepalive(&mut their_tun, my_keepalive);
+        assert_ne!(
+            my_tun.current, responder_session,
+            "the newer session takes over"
+        );
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+        assert_packet_roundtrip(&mut their_tun, &mut my_tun);
+    }
+
+    /// A peer's initiation whose response is lost must not take over the session timers: we
+    /// remain the initiator of the current session and still rekey on time.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn unconfirmed_responder_session_keeps_session_timers() {
+        const NEVER: Duration = Duration::from_secs(1000);
+        const PEER_REKEY: Duration = Duration::from_secs(60);
+
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        // Keep the passive keepalive and new-handshake timers out of the way.
+        my_tun.dangerously_set_timer_params(TimerParams {
+            keepalive_timeout: NEVER..=NEVER,
+            new_handshake_timeout: NEVER..=NEVER,
+            ..TimerParams::default()
+        });
+        complete_handshake(&mut my_tun, &mut their_tun);
+        let current = my_tun.current;
+
+        MockClock::advance(PEER_REKEY);
+        assert!(matches!(my_tun.update_timers(), Ok(None)));
+        let their_init = create_handshake_init(&mut their_tun);
+        let _lost_resp = create_handshake_response(&mut my_tun, their_init);
+
+        assert_eq!(my_tun.current, current);
+        assert_eq!(my_tun.time_since_last_handshake(), Some(PEER_REKEY));
+        assert!(my_tun.has_active_session());
+
+        // Send data on the current session, then reach REKEY_AFTER_TIME since its handshake.
+        MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(my_tun.update_timers(), Ok(None)));
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+        MockClock::advance(REKEY_AFTER_TIME - PEER_REKEY - Duration::from_secs(1));
+        update_timer_results_in_handshake(&mut my_tun);
+    }
+
+    /// A responder session becomes current once the initiator confirms it. Until then no
+    /// handshake is reported, and afterwards the handshake time is the confirmation time.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn responder_session_is_confirmed_by_first_packet() {
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        let their_init = create_handshake_init(&mut their_tun);
+        let my_resp = create_handshake_response(&mut my_tun, their_init);
+        assert_eq!(my_tun.time_since_last_handshake(), None);
+        assert!(!my_tun.has_active_session());
+
+        MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(my_tun.update_timers(), Ok(None)));
+        let keepalive = expect_keepalive(&mut their_tun, my_resp);
+        parse_keepalive(&mut my_tun, keepalive);
+        assert_eq!(my_tun.time_since_last_handshake(), Some(Duration::ZERO));
+        assert!(my_tun.has_active_session());
+
+        MockClock::advance(Duration::from_secs(5));
+        assert_eq!(
+            my_tun.time_since_last_handshake(),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    /// A confirmed responder session that is newer than the current initiator session takes
+    /// over, including the role: as responder we no longer rekey on send.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn newer_responder_session_takes_over_on_confirmation() {
+        const NEVER: Duration = Duration::from_secs(1000);
+        const PEER_REKEY: Duration = Duration::from_secs(60);
+
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        my_tun.dangerously_set_timer_params(TimerParams {
+            keepalive_timeout: NEVER..=NEVER,
+            new_handshake_timeout: NEVER..=NEVER,
+            ..TimerParams::default()
+        });
+        complete_handshake(&mut my_tun, &mut their_tun);
+        let initiator_session = my_tun.current;
+
+        MockClock::advance(PEER_REKEY);
+        assert!(matches!(my_tun.update_timers(), Ok(None)));
+        let their_init = create_handshake_init(&mut their_tun);
+        let my_resp = create_handshake_response(&mut my_tun, their_init);
+        let keepalive = expect_keepalive(&mut their_tun, my_resp);
+        parse_keepalive(&mut my_tun, keepalive);
+
+        assert_ne!(my_tun.current, initiator_session);
+        assert_eq!(my_tun.time_since_last_handshake(), Some(Duration::ZERO));
+
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+        MockClock::advance(REKEY_AFTER_TIME);
+        assert!(
+            matches!(my_tun.update_timers(), Ok(None)),
+            "the responder must not rekey on send"
+        );
+    }
+
+    /// Packets arriving late on an older session, created within the same timer tick as the
+    /// current one, must not move `current` back to the older session.
+    #[test]
+    fn late_packets_on_older_session_keep_current() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let encrypt = |tun: &mut Tunn| {
+            tun.handle_outgoing_packet(create_ipv4_udp_packet().into_bytes(), None)
+                .expect("session should encrypt the packet")
+        };
+        let late = [encrypt(&mut their_tun), encrypt(&mut their_tun)];
+
+        // Rekey within the same timer tick. A second handshake needs a newer timestamp.
+        #[cfg(feature = "mock_instant")]
+        MockClock::advance(Duration::from_micros(1));
+        complete_handshake(&mut my_tun, &mut their_tun);
+        let current = my_tun.current;
+
+        for late in late {
+            let result = my_tun.handle_incoming_packet(late);
+            assert!(matches!(result, TunnResult::WriteToTunnel(_)));
+            assert_eq!(
+                my_tun.current, current,
+                "a late packet must not move current back"
+            );
+
+            let result = my_tun.handle_incoming_packet(encrypt(&mut their_tun));
+            assert!(matches!(result, TunnResult::WriteToTunnel(_)));
+            assert_eq!(my_tun.current, current);
+        }
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+    }
+
+    /// Answering a peer initiation near the end of our own handshake attempt window must not
+    /// let `REKEY_ATTEMPT_TIME` wipe the fresh unconfirmed responder session.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn rekey_attempt_expiry_preserves_unconfirmed_responder_session() {
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        let _lost_init = create_handshake_init(&mut my_tun);
+
+        // Advance near REKEY_ATTEMPT_TIME, then answer a peer initiation whose confirmation
+        // arrives after our own attempt window elapses.
+        MockClock::set_time(REKEY_ATTEMPT_TIME - Duration::from_secs(4));
+        let _ = my_tun.update_timers();
+        let their_init = create_handshake_init(&mut their_tun);
+        let my_resp = create_handshake_response(&mut my_tun, their_init);
+
+        MockClock::set_time(REKEY_ATTEMPT_TIME + Duration::from_secs(1));
+        assert!(
+            matches!(my_tun.update_timers(), Ok(None)),
+            "unconfirmed responder session must defer expiry"
+        );
+        assert!(!my_tun.is_expired());
+        assert!(
+            my_tun.handshake.timer().is_none(),
+            "our stale initiation must stop retransmitting"
+        );
+
+        let their_keepalive = expect_keepalive(&mut their_tun, my_resp);
+        parse_keepalive(&mut my_tun, their_keepalive);
+        assert!(my_tun.has_active_session());
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+        assert_packet_roundtrip(&mut their_tun, &mut my_tun);
+    }
+
+    /// A pending responder session must not encrypt outgoing packets before the initiator
+    /// confirms possession of the session keys.
+    #[test]
+    fn unconfirmed_responder_session_does_not_encapsulate_outgoing_data() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        let their_init = create_handshake_init(&mut their_tun);
+        let my_resp = create_handshake_response(&mut my_tun, their_init);
+
+        let packet = create_ipv4_udp_packet().into_bytes();
+        assert!(
+            my_tun.encapsulate_with_session(packet).is_err(),
+            "responder must wait for peer confirmation before sending data"
+        );
+
+        let their_keepalive = expect_keepalive(&mut their_tun, my_resp);
+        parse_keepalive(&mut my_tun, their_keepalive);
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+        assert_packet_roundtrip(&mut their_tun, &mut my_tun);
+    }
+
+    /// Retry exhaustion must not wipe a valid responder session even when the peer initiated
+    /// before our own attempt started, and must purge stale staged packets.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn rekey_attempt_expiry_preserves_earlier_responder_session_and_purges_queue() {
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        let their_init = create_handshake_init(&mut their_tun);
+        let my_resp = create_handshake_response(&mut my_tun, their_init);
+
+        MockClock::set_time(Duration::from_secs(1));
+        assert!(matches!(my_tun.update_timers(), Ok(None)));
+        let _staged = my_tun.handle_outgoing_packet(create_ipv4_udp_packet().into_bytes(), None);
+        assert!(my_tun.has_queued_packets());
+
+        MockClock::set_time(Duration::from_secs(1) + REKEY_ATTEMPT_TIME + Duration::from_secs(1));
+        assert!(
+            matches!(my_tun.update_timers(), Ok(None)),
+            "unexpired responder session must survive retry abandonment"
+        );
+        assert!(!my_tun.is_expired());
+        assert!(
+            !my_tun.has_queued_packets(),
+            "staged packets must be purged"
+        );
+
+        let their_keepalive = expect_keepalive(&mut their_tun, my_resp);
+        parse_keepalive(&mut my_tun, their_keepalive);
+        assert!(my_tun.has_active_session());
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+        assert_packet_roundtrip(&mut their_tun, &mut my_tun);
+    }
+
+    /// Repeated unanswered peer initiations must stay in `pending_responder` and never evict
+    /// the confirmed active send session.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn repeated_unanswered_peer_initiations_do_not_evict_current_session() {
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+
+        for step in 1..=(N_SESSIONS as u64 + 2) {
+            MockClock::advance(Duration::from_secs(6));
+            let _ = my_tun.update_timers();
+            let _ = their_tun.update_timers();
+            let their_init = their_tun
+                .format_handshake_initiation(true)
+                .expect("peer should initiate");
+            let _lost_resp = create_handshake_response(&mut my_tun, their_init);
+            assert!(
+                my_tun.has_active_session(),
+                "current session must survive {step} unanswered peer initiations"
+            );
+        }
+
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+        assert_packet_roundtrip(&mut their_tun, &mut my_tun);
+    }
+
+    /// A stopped initiation retained in `previous` must expire and be invalidated by later
+    /// confirmed handshakes so a long-delayed response cannot displace a working session.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn stale_previous_initiation_cannot_displace_later_session() {
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        let my_init = create_handshake_init(&mut my_tun);
+        let their_init = create_handshake_init(&mut their_tun);
+        let my_resp = create_handshake_response(&mut my_tun, their_init);
+        let delayed_resp = create_handshake_response(&mut their_tun, my_init);
+
+        // Confirm responder session #1, moving `my_init` into `previous`.
+        let ka1 = expect_keepalive(&mut their_tun, my_resp);
+        parse_keepalive(&mut my_tun, ka1);
+
+        // A later peer handshake supersedes `previous`.
+        MockClock::advance(Duration::from_secs(10));
+        let _ = my_tun.update_timers();
+        let _ = their_tun.update_timers();
+        let their_init2 = their_tun.format_handshake_initiation(true).unwrap();
+        let my_resp2 = create_handshake_response(&mut my_tun, their_init2);
+        let ka2 = expect_keepalive(&mut their_tun, my_resp2);
+        parse_keepalive(&mut my_tun, ka2);
+
+        let current_before = my_tun.current_session_generation();
+        assert!(matches!(
+            my_tun.handle_incoming_packet(WgKind::HandshakeResp(delayed_resp)),
+            TunnResult::Err(WireGuardError::UnexpectedPacket)
+        ));
+        assert_eq!(my_tun.current_session_generation(), current_before);
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+        assert_packet_roundtrip(&mut their_tun, &mut my_tun);
+
+        // Even without a second handshake, `previous` expires after REKEY_ATTEMPT_TIME.
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        let my_init = create_handshake_init(&mut my_tun);
+        let their_init = create_handshake_init(&mut their_tun);
+        let my_resp = create_handshake_response(&mut my_tun, their_init);
+        let delayed_resp = create_handshake_response(&mut their_tun, my_init);
+        let ka = expect_keepalive(&mut their_tun, my_resp);
+        parse_keepalive(&mut my_tun, ka);
+
+        MockClock::advance(REKEY_ATTEMPT_TIME + Duration::from_secs(1));
+        let _ = my_tun.update_timers();
+        assert!(matches!(
+            my_tun.handle_incoming_packet(WgKind::HandshakeResp(delayed_resp)),
+            TunnResult::Err(WireGuardError::UnexpectedPacket)
+        ));
+    }
+
+    /// Key cleanup at `REJECT_AFTER_TIME * 3` (540 s) must preserve an already-scheduled long
+    /// persistent keepalive (e.g., 600 s) instead of postponing it to 1,140 s.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn key_cleanup_preserves_long_persistent_keepalive_schedule() {
+        const KEEPALIVE_SECS: u16 = 600;
+        const TICK: Duration = Duration::from_secs(1);
+
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns_with_keepalive(Some(KEEPALIVE_SECS));
+        let Ok(Some(WgKind::HandshakeInit(init))) = my_tun.update_timers() else {
+            panic!("initial persistent keepalive should initiate immediately");
+        };
+        let resp = create_handshake_response(&mut their_tun, init);
+        let ka = expect_keepalive(&mut my_tun, resp);
+        parse_keepalive(&mut their_tun, ka);
+
+        let mut saw_zero_keys = false;
+        let mut fired_at = None;
+        for _ in 0..700 {
+            MockClock::advance(TICK);
+            match my_tun.update_timers() {
+                Ok(None) => {}
+                Err(WireGuardError::ConnectionExpired) => {
+                    saw_zero_keys = true;
+                }
+                Ok(Some(WgKind::HandshakeInit(_))) => {
+                    fired_at = Some(MockClock::time());
+                    break;
+                }
+                other => panic!("unexpected timer result: {other:?}"),
+            }
+        }
+        assert!(saw_zero_keys, "540 s key cleanup should have run");
+        assert_eq!(
+            fired_at,
+            Some(Duration::from_secs(u64::from(KEEPALIVE_SECS))),
+            "persistent keepalive must fire at 600 s, not 1140 s"
+        );
     }
 
     /// Test that timers "freeze" if clock jumps back.

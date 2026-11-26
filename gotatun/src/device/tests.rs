@@ -24,6 +24,7 @@ use crate::noise::TimerParams;
 use crate::noise::index_table::IndexTable;
 use crate::packet::{Ip, Packet};
 
+mod incoming;
 pub mod mock;
 
 /// Assert that the expected number of packets is sent.

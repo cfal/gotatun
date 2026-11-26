@@ -29,7 +29,7 @@ use crate::sleepyinstant::Instant;
 // https://www.wireguard.com/papers/wireguard.pdf#page=14
 pub(crate) const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
 const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
-const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
+pub(crate) const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
 pub(crate) const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
@@ -39,8 +39,10 @@ pub(crate) const MAX_JITTER: Duration = Duration::from_millis(333);
 pub enum TimerName {
     /// Current time, updated each call to `update_timers`
     TimeCurrent,
-    /// Time when last handshake was completed
+    /// Time the current session was confirmed
     TimeSessionEstablished,
+    /// Time session keys were last derived by a handshake, confirmed or not
+    TimeSessionDerived,
     /// Time the last attempt for a new handshake began
     TimeLastHandshakeStarted,
     /// Time we last received and authenticated a packet
@@ -106,12 +108,11 @@ impl Default for TimerParams {
 
 #[derive(Debug)]
 pub struct Timers {
-    /// Is the owner of the timer the initiator or the responder for the last handshake?
+    /// Is the owner of the timer the initiator or the responder for the current session?
     is_initiator: bool,
     /// Start time of the tunnel
     time_started: Instant,
     timers: [Duration; TimerName::Top as usize],
-    pub(super) session_timers: [Duration; super::N_SESSIONS],
     /// Time the first data packet was received without us sending anything back, if any.
     /// A passive keepalive is due `keepalive_timeout` after this time.
     want_keepalive: Option<Duration>,
@@ -144,7 +145,6 @@ impl Timers {
             is_initiator: false,
             time_started: Instant::now(),
             timers: Default::default(),
-            session_timers: Default::default(),
             want_keepalive: Default::default(),
             want_handshake: Default::default(),
             persistent_keepalive,
@@ -172,6 +172,13 @@ impl Timers {
 
     fn is_initiator(&self) -> bool {
         self.is_initiator
+    }
+
+    fn is_persistent_keepalive_due(&self, now: Duration) -> bool {
+        self.persistent_keepalive.is_some_and(|interval| {
+            self.persistent_keepalive_due
+                || now.saturating_sub(self[TimePersistentKeepalive]) >= interval
+        })
     }
 
     // We don't really clear the timers, but we set them to the current time to
@@ -264,14 +271,8 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         }
     }
 
-    pub(super) fn timer_tick_session_established(
-        &mut self,
-        is_initiator: bool,
-        session_idx: usize,
-    ) {
+    pub(super) fn timer_tick_session_established(&mut self, is_initiator: bool) {
         self.timer_tick(TimeSessionEstablished);
-        self.timers.session_timers[session_idx % crate::noise::N_SESSIONS] =
-            self.timers[TimeCurrent];
         self.timers.is_initiator = is_initiator;
         self.timers.rekey_after_time = self.sample_timer(|p| &p.rekey_after_time);
     }
@@ -279,28 +280,49 @@ impl<R: rand::RngCore + Send> Tunn<R> {
     // We don't really clear the timers, but we set them to the current time to
     // so the reference time frame is the same
     pub(super) fn clear_all(&mut self) {
-        for session in &mut self.sessions {
-            *session = None;
-        }
+        self.clear_sessions();
 
         self.packet_queue.clear();
 
         self.timers.clear();
     }
 
-    fn update_session_timers(&mut self, time_now: Duration) {
-        let timers = &mut self.timers;
+    /// Expires a failed handshake attempt when no unexpired sessions remain.
+    ///
+    /// A configured persistent keepalive initiates the next handshake one interval later,
+    /// rather than on the next tick.
+    fn expire_handshake_attempt(&mut self) {
+        self.handshake.set_expired();
+        self.clear_all();
+        self.timers.persistent_keepalive_due = false;
+    }
 
-        for (i, t) in timers.session_timers.iter_mut().enumerate() {
-            if time_now - *t > REJECT_AFTER_TIME {
-                // Forget about expired sessions
-                if let Some(session) = self.sessions[i].take() {
-                    tracing::trace!(
-                        "SESSION_EXPIRED(REJECT_AFTER_TIME): {}",
-                        session.receiving_index
-                    );
-                }
-                *t = time_now;
+    /// Zeroes all keys after `REJECT_AFTER_TIME * 3` without postponing an already-scheduled
+    /// persistent keepalive.
+    fn expire_zero_keys(&mut self) {
+        let saved_keepalive = self.timers[TimePersistentKeepalive];
+        let saved_due = self.timers.persistent_keepalive_due;
+        self.handshake.set_expired();
+        self.clear_all();
+        self.timers[TimePersistentKeepalive] = saved_keepalive;
+        self.timers.persistent_keepalive_due = saved_due;
+    }
+
+    fn update_session_timers(&mut self, time_now: Duration) {
+        for slot in self
+            .sessions
+            .iter_mut()
+            .chain(std::iter::once(&mut self.pending_responder))
+        {
+            // Forget about expired sessions
+            if let Some(expired) = slot
+                && time_now - expired.derived_at > REJECT_AFTER_TIME
+            {
+                tracing::trace!(
+                    "SESSION_EXPIRED(REJECT_AFTER_TIME): {}",
+                    expired.session.receiving_index
+                );
+                *slot = None;
             }
         }
     }
@@ -324,15 +346,24 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 
         // Load timers only once:
         let session_established = self.timers[TimeSessionEstablished];
+        let session_derived = self.timers[TimeSessionDerived];
         let handshake_started = self.timers[TimeLastHandshakeStarted];
         let data_packet_received = self.timers[TimeLastDataPacketReceived];
         let data_packet_sent = self.timers[TimeLastDataPacketSent];
-        let persistent_keepalive = self.timers.persistent_keepalive;
 
         {
             if self.handshake.is_expired() {
+                // Persistent keepalive keeps initiating handshakes after expiry so that an idle
+                // peer recovers without outbound traffic, like Linux
+                // `wg_expired_send_persistent_keepalive` and wireguard-go.
+                if self.timers.is_persistent_keepalive_due(now) {
+                    tracing::debug!("HANDSHAKE(PERSISTENT_KEEPALIVE after expiry)");
+                    return Ok(self.format_handshake_initiation(true).map(Into::into));
+                }
                 return Err(WireGuardError::ConnectionExpired);
             }
+
+            self.handshake.expire_previous();
 
             // Clear cookie after COOKIE_EXPIRATION_TIME
             if self.handshake.has_cookie()
@@ -343,23 +374,33 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 
             // All ephemeral private keys and symmetric session keys are zeroed out after
             // (REJECT_AFTER_TIME * 3) ms if no new keys have been exchanged.
-            if now - session_established >= REJECT_AFTER_TIME * 3 {
+            if now - session_derived >= REJECT_AFTER_TIME * 3 {
                 tracing::trace!("CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
-                self.handshake.set_expired();
-                self.clear_all();
+                self.expire_zero_keys();
                 return Err(WireGuardError::ConnectionExpired);
             }
 
             if let Some(time_init_sent) = self.handshake.timer() {
                 // Handshake Initiation Retransmission
                 if now - handshake_started >= REKEY_ATTEMPT_TIME {
+                    // Abandoning our timed-out initiation clears staged traffic without wiping
+                    // unexpired sessions, which stay usable until REJECT_AFTER_TIME or
+                    // REJECT_AFTER_TIME * 3.
+                    if self.has_unexpired_session() {
+                        tracing::debug!(
+                            "HANDSHAKE(REKEY_ATTEMPT_TIME abandoned while unexpired session remains)"
+                        );
+                        self.handshake.abandon_initiation();
+                        self.packet_queue.clear();
+                        return Ok(None);
+                    }
+
                     // After REKEY_ATTEMPT_TIME ms of trying to initiate a new handshake,
                     // the retries give up and cease, and clear all existing packets queued
                     // up to be sent. If a packet is explicitly queued up to be sent, then
                     // this timer is reset.
                     tracing::debug!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
-                    self.handshake.set_expired();
-                    self.clear_all();
+                    self.expire_handshake_attempt();
                     return Err(WireGuardError::ConnectionExpired);
                 }
 
@@ -426,11 +467,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
                     }
 
                     // Persistent KEEPALIVE
-                    if let Some(persistent_keepalive) = persistent_keepalive
-                        && (self.timers.persistent_keepalive_due
-                            || now.saturating_sub(self.timers[TimePersistentKeepalive])
-                                >= persistent_keepalive)
-                    {
+                    if self.timers.is_persistent_keepalive_due(now) {
                         tracing::trace!("KEEPALIVE(PERSISTENT_KEEPALIVE)");
                         self.timers.persistent_keepalive_due = false;
                         self.timer_tick(TimePersistentKeepalive);
@@ -456,8 +493,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
     ///
     /// Returns `None` if no session has been established.
     pub fn time_since_last_handshake(&self) -> Option<Duration> {
-        let current_session = self.current;
-        if self.sessions[current_session % super::N_SESSIONS].is_some() {
+        if self.current_session().is_some() {
             let duration_since_tun_start = self.timers.now();
             let duration_since_session_established = self.timers[TimeSessionEstablished];
 
@@ -469,12 +505,9 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 
     /// Whether the current session exists and is not yet due for rekeying.
     pub fn has_active_session(&self) -> bool {
-        let current_session = self.current % super::N_SESSIONS;
-        let session_age = self
-            .timers
-            .now()
-            .saturating_sub(self.timers.session_timers[current_session]);
-        self.sessions[current_session].is_some() && session_age < self.timers.rekey_after_time
+        let now = self.timers.now();
+        self.current_session()
+            .is_some_and(|slot| now.saturating_sub(slot.derived_at) < self.timers.rekey_after_time)
     }
 
     /// Get the persistent keepalive interval in seconds.
